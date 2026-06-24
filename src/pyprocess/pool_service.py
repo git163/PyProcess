@@ -84,8 +84,7 @@ class ProcessPoolService:
     @property
     def is_running(self) -> bool:
         """服务是否处于运行状态。"""
-        with self._lock:
-            return self._started and not self._shutdown
+        return self._pool.is_running
 
     @property
     def worker_pids(self) -> list[int]:

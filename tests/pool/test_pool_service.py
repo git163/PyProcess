@@ -1,8 +1,12 @@
 """ProcessPoolService 单元测试。"""
 
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +25,22 @@ def _sleep_and_return(value: float, duration: float) -> float:
 
 def _raise_value_error(message: str) -> None:
     raise ValueError(message)
+
+
+def _return_unpicklable() -> object:
+    """返回一个不可 pickle 的局部函数对象。"""
+
+    def _local() -> None:
+        pass
+
+    return _local
+
+
+def _exit_task() -> None:
+    """任务中主动调用 sys.exit。"""
+    import sys
+
+    sys.exit(42)
 
 
 def test_service_submit_and_result():
@@ -443,3 +463,209 @@ def test_service_context_manager_reuse() -> None:
             all_pids.update(service.worker_pids)
 
     _assert_no_residuals(list(all_pids), timeout=3)
+
+
+def test_service_wait_method() -> None:
+    """ProcessPoolService 的 Future.wait 应在任务完成时返回 True。"""
+    with ProcessPoolService(max_workers=2) as service:
+        future = service.submit(_sleep_and_return, 42, 0.2)
+        assert future.wait(timeout=5)
+        assert future.result(timeout=0) == 42
+
+
+def test_service_wait_method_timeout() -> None:
+    """ProcessPoolService 的 Future.wait 超时应返回 False。"""
+    with ProcessPoolService(max_workers=2) as service:
+        future = service.submit(time.sleep, 5)
+        assert not future.wait(timeout=0.1)
+
+
+def test_service_mass_tasks() -> None:
+    """ProcessPoolService 提交大量任务并验证结果正确。"""
+    task_count = 1000
+    with ProcessPoolService(max_workers=8) as service:
+        futures = [service.submit(_add, i, i) for i in range(task_count)]
+        results = [f.result(timeout=30) for f in futures]
+    assert results == [i * 2 for i in range(task_count)]
+
+
+def test_service_large_payload() -> None:
+    """ProcessPoolService 传输较大任务负载。"""
+    size = 2 * 1024 * 1024  # 2MB
+    data = list(range(size))
+
+    with ProcessPoolService(max_workers=2) as service:
+        future = service.submit(sum, data)
+        assert future.result(timeout=30) == sum(data)
+
+
+def test_service_worker_killed_triggers_shutdown() -> None:
+    """工作进程被 kill 后，ProcessPoolService 应触发 shutdown 且不残留。"""
+    service = ProcessPoolService(max_workers=2)
+    service.start()
+    try:
+        service.submit(time.sleep, 60)
+        time.sleep(0.3)  # 让任务被取走
+        pids = service.worker_pids
+        assert len(pids) == 2
+
+        os.kill(pids[0], signal.SIGKILL)
+
+        # 等待健康监控触发 shutdown
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not service.is_running:
+                break
+            time.sleep(0.05)
+        assert not service.is_running, "Health watcher should trigger service shutdown"
+    finally:
+        if service.is_running:
+            service.shutdown(wait=True)
+
+    _assert_no_residuals(pids, timeout=3)
+
+
+_SERVICE_SIGNAL_HELPER = Path(__file__).with_name("_service_signal_helper.py")
+
+
+def _start_service_signal_helper() -> tuple[subprocess.Popen, list[int]]:
+    """启动 ProcessPoolService 信号测试辅助脚本并解析工作进程 PID。"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    proc = subprocess.Popen(
+        [sys.executable, str(_SERVICE_SIGNAL_HELPER)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+    pids: list[int] = []
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        line = proc.stdout.readline()
+        if not line:
+            time.sleep(0.05)
+            continue
+        if line.startswith("WORKERS"):
+            pids = [int(x) for x in line.strip().split()[1].split(",")]
+            break
+
+    if not pids:
+        stderr = proc.stderr.read()
+        proc.kill()
+        proc.wait(timeout=5)
+        raise RuntimeError(f"Failed to collect worker PIDs from helper. stderr: {stderr}")
+
+    return proc, pids
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics only")
+def test_service_sigterm_no_orphan_workers() -> None:
+    """SIGTERM ProcessPoolService 主进程后，所有工作进程应被清理。"""
+    proc, pids = _start_service_signal_helper()
+    try:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+        assert proc.returncode is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    _assert_no_residuals(pids, timeout=6)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics only")
+def test_service_sigkill_no_orphan_workers() -> None:
+    """SIGKILL ProcessPoolService 主进程后，工作进程应通过孤儿检测退出。"""
+    proc, pids = _start_service_signal_helper()
+    try:
+        proc.kill()
+        proc.wait(timeout=10)
+        assert proc.returncode is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    _assert_no_residuals(pids, timeout=6)
+
+
+def test_service_result_timeout() -> None:
+    """ProcessPoolService 的 Future.result 超时等待应抛出 TimeoutError。"""
+    with ProcessPoolService(max_workers=2) as service:
+        future = service.submit(time.sleep, 5)
+        with pytest.raises(TimeoutError):
+            future.result(timeout=0.1)
+        assert not future.done()
+
+
+def test_service_normal_shutdown_no_orphans() -> None:
+    """ProcessPoolService 正常 shutdown 后所有工作进程应已退出。"""
+    service = ProcessPoolService(max_workers=3)
+    service.start()
+    pids = service.worker_pids
+    service.shutdown(wait=True)
+    _assert_no_residuals(pids, timeout=2)
+
+
+def test_service_unpicklable_arguments() -> None:
+    """ProcessPoolService 提交不可 pickle 的参数时，对应 Future 应超时；服务不被阻塞。"""
+    with ProcessPoolService(max_workers=2) as service:
+        bad_future = service.submit(_add, (lambda x: x), 1)  # noqa: E731
+        with pytest.raises(TimeoutError):
+            bad_future.result(timeout=0.5)
+
+        future = service.submit(_add, 2, 3)
+        assert future.result(timeout=5) == 5
+
+
+def test_service_unpicklable_return_value() -> None:
+    """ProcessPoolService 任务返回不可 pickle 的结果时，对应 Future 会超时；服务不被阻塞。"""
+    with ProcessPoolService(max_workers=2) as service:
+        bad_future = service.submit(_return_unpicklable)
+        with pytest.raises(TimeoutError):
+            bad_future.result(timeout=0.5)
+
+        future = service.submit(_add, 2, 3)
+        assert future.result(timeout=5) == 5
+
+
+def test_service_worker_sys_exit_in_task() -> None:
+    """任务中调用 sys.exit 会导致工作进程退出，ProcessPoolService 健康监控触发 shutdown。"""
+    service = ProcessPoolService(max_workers=2)
+    service.start()
+    try:
+        bad = service.submit(_exit_task)
+        service.submit(_add, 1, 2)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not service.is_running:
+                break
+            time.sleep(0.05)
+        assert not service.is_running, (
+            "Health watcher should trigger service shutdown after sys.exit"
+        )
+    finally:
+        if service.is_running:
+            service.shutdown(wait=True)
+
+    with pytest.raises(TaskError, match="shut down"):
+        bad.result(timeout=0)
+
+
+def test_service_sustained_load() -> None:
+    """ProcessPoolService 持续一段时间高负载提交。"""
+    batch_size = 50
+    total_batches = 20
+    with ProcessPoolService(max_workers=8) as service:
+        all_results: list[int] = []
+        for batch in range(total_batches):
+            futures = [service.submit(_add, batch * batch_size + i, i) for i in range(batch_size)]
+            batch_results = [f.result(timeout=30) for f in futures]
+            all_results.extend(batch_results)
+
+    expected = [
+        batch * batch_size + i + i for batch in range(total_batches) for i in range(batch_size)
+    ]
+    assert sorted(all_results) == sorted(expected)

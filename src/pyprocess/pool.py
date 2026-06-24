@@ -256,6 +256,12 @@ class ProcessPool:
         with self._lock:
             return [w.pid for w in self._workers if w.pid is not None]
 
+    @property
+    def is_running(self) -> bool:
+        """进程池是否处于运行状态。"""
+        with self._lock:
+            return self._started and not self._shutdown
+
     def _install_signal_handlers(self) -> None:
         """注册 SIGTERM/SIGINT 处理函数。"""
         if self._signal_installed:
