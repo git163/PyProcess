@@ -22,6 +22,43 @@ with ProcessPool(max_workers=4) as pool:
 
 上下文管理器会自动调用 `start()` 和 `shutdown(wait=True)`，确保进程池被正确关闭。
 
+## 作为服务长期持有（推荐）
+
+如果你需要在 Web 服务、后台任务队列等场景中反复提交任务，应该避免频繁创建/销毁进程池。
+可以使用 `WorkerService` 把进程池作为长生命周期对象持有：
+
+```python
+from pyprocess.pool_service import WorkerService
+
+
+def heavy_compute(n: int) -> int:
+    return sum(i * i for i in range(n))
+
+
+# 方式一：上下文管理器
+with WorkerService(max_workers=4) as service:
+    future = service.submit(heavy_compute, 100_000)
+    print(future.result(timeout=10))
+
+# 方式二：显式生命周期管理
+service = WorkerService(max_workers=4)
+service.start()
+
+try:
+    futures = [service.submit(heavy_compute, i) for i in range(100)]
+    results = [f.result(timeout=10) for f in futures]
+    print(results)
+finally:
+    service.shutdown(wait=True)
+```
+
+`WorkerService` 特点：
+- 线程安全
+- 首次 `submit()` 会自动启动（懒启动）
+- 关闭后允许再次 `start()` 重启
+- 提供 `is_running` 和 `worker_pids` 属性
+- 支持 `submit()` 和 `submit_no_wait()`
+
 ## 核心概念
 
 ### ProcessPool
