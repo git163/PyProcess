@@ -299,12 +299,22 @@ def test_high_load_shutdown_no_orphans():
 _RANDOM_SIGNAL_HELPER = Path(__file__).with_name("_random_signal_helper.py")
 
 
-def _start_random_signal_helper(max_workers: int = 4) -> tuple[subprocess.Popen, list[int]]:
+def _start_random_signal_helper(
+    max_workers: int = 4,
+    duration: float = 0.5,
+    multiplier: int = 4,
+) -> tuple[subprocess.Popen, list[int]]:
     """启动随机信号测试辅助脚本并解析工作进程 PID。"""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
     proc = subprocess.Popen(
-        [sys.executable, str(_RANDOM_SIGNAL_HELPER), str(max_workers)],
+        [
+            sys.executable,
+            str(_RANDOM_SIGNAL_HELPER),
+            str(max_workers),
+            str(duration),
+            str(multiplier),
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -388,3 +398,91 @@ def test_random_signal_during_long_tasks(_) -> None:
 
     # 信号触发后约 5 秒内不应有残留工作进程
     _assert_no_residuals(pids, timeout=6)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics only")
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGKILL])
+def test_signal_during_very_long_tasks(sig: int) -> None:
+    """工作者执行 60 秒长任务期间发送信号，验证无残留。"""
+    proc, pids = _start_random_signal_helper(max_workers=4, duration=60.0, multiplier=8)
+
+    # 等待任务被取走后发送信号
+    time.sleep(0.5)
+    proc.send_signal(sig)
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+        pytest.fail(f"Helper did not exit within 10s after signal {sig}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    _assert_no_residuals(pids, timeout=6)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics only")
+def test_signal_storm_during_long_tasks() -> None:
+    """长任务期间先 SIGTERM 再快速 SIGKILL，验证无残留。"""
+    proc, pids = _start_random_signal_helper(max_workers=4, duration=60.0, multiplier=8)
+
+    time.sleep(0.3)
+    proc.send_signal(signal.SIGTERM)
+    time.sleep(0.1)
+    proc.send_signal(signal.SIGKILL)
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+        pytest.fail("Helper did not exit within 10s after signal storm")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    _assert_no_residuals(pids, timeout=6)
+
+
+def test_high_load_with_long_tasks_shutdown() -> None:
+    """高负载且混合长任务时主动 shutdown，验证按时完成且无残留。"""
+    task_count_short = 500
+    task_count_long = 8
+    pool = ProcessPool(max_workers=4)
+    pool.start()
+    pids = pool.worker_pids
+
+    for i in range(task_count_short):
+        pool.submit(_add_one, i)
+    for i in range(task_count_long):
+        pool.submit(_sleep_and_return, i, 60.0)
+
+    start = time.monotonic()
+    pool.shutdown(wait=True, timeout=2.0)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5.0, f"Shutdown took too long under mixed load: {elapsed:.2f}s"
+    _assert_no_residuals(pids, timeout=2)
+
+
+def test_high_load_shutdown_cancels_pending_futures() -> None:
+    """高负载 shutdown 后，未开始任务的 Future 应被立即取消。"""
+    pool = ProcessPool(max_workers=2)
+    pool.start()
+
+    # 提交远超工作者处理能力的任务
+    futures = [pool.submit(_sleep_and_return, i, 60.0) for i in range(100)]
+    pool.shutdown(wait=True, timeout=1.0)
+
+    cancelled = 0
+    for future in futures:
+        with pytest.raises(TaskError, match="shut down"):
+            future.result(timeout=0)
+        cancelled += 1
+
+    # 至少大部分任务被取消（正在执行的任务可能已完成或被终止后取消）
+    assert cancelled >= len(futures) // 2
