@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(find *)",
+      "Bash(tree *)",
+      "Bash(grep *)",
+      "Bash(mkdir *)",
+      "Bash(touch *)",
+      "Bash(python -m pytest *)",
+      "Bash(python -m pip install *)",
+      "Bash(ruff check *)",
+      "Bash(ruff format *)",
+      "Bash(code .)"
+    ]
+  }
+}
