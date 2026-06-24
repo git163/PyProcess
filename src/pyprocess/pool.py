@@ -42,18 +42,30 @@ DEFAULT_TERMINATE_JOIN_TIMEOUT_NO_WAIT: float = 0.2
 DEFAULT_RESULT_QUEUE_TIMEOUT: float = 0.2
 """结果收集线程从结果队列取数据的超时时间（秒）。"""
 
-SIGNAL_GRACEFUL_TIMEOUT: float = 4.0
-"""SIGTERM 触发优雅关闭时，给工作者的最长等待时间（秒）。
-
-留出 1 秒余量给后续的 terminate / kill 阶段，确保整个信号清理流程
-在约 5 秒内完成。
-"""
+SIGNAL_CLEANUP_BUDGET: float = 5.0
+"""信号触发后，整个清理流程（优雅等待 + terminate + kill）的总预算（秒）。"""
 
 SIGNAL_TERMINATE_JOIN_TIMEOUT: float = 0.5
 """信号触发关闭时，terminate 后等待工作者退出的秒数。"""
 
 SIGNAL_KILL_JOIN_TIMEOUT: float = 0.5
 """信号触发关闭时，kill 后等待工作者退出的秒数。"""
+
+SIGNAL_GRACEFUL_TIMEOUT: float = (
+    SIGNAL_CLEANUP_BUDGET - SIGNAL_TERMINATE_JOIN_TIMEOUT - SIGNAL_KILL_JOIN_TIMEOUT
+)
+"""SIGTERM 触发优雅关闭时，给工作者的最长等待时间（秒）。
+
+由 SIGNAL_CLEANUP_BUDGET 扣除 terminate / kill 阶段的预留时间后自动推导，
+避免手动调整时超时常数错配。
+"""
+
+# 模块加载时校验：信号清理总预算必须足够覆盖各阶段。
+if SIGNAL_GRACEFUL_TIMEOUT <= 0:
+    raise ValueError(
+        "SIGNAL_CLEANUP_BUDGET must be greater than the sum of "
+        "SIGNAL_TERMINATE_JOIN_TIMEOUT and SIGNAL_KILL_JOIN_TIMEOUT"
+    )
 
 SHUTDOWN_SENTINEL: Any = None
 """任务队列关闭哨兵。"""

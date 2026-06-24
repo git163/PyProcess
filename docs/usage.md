@@ -180,9 +180,10 @@ with ProcessPool(max_workers=4) as pool:
 | `DEFAULT_KILL_JOIN_TIMEOUT` | 1.0 | `kill` 后等待时间（秒） |
 | `DEFAULT_WORKER_POLL_INTERVAL` | 0.5 | 孤儿检测/健康监控轮询间隔（秒） |
 | `DEFAULT_RESULT_QUEUE_TIMEOUT` | 0.2 | 结果收集线程队列取数超时（秒） |
-| `SIGNAL_GRACEFUL_TIMEOUT` | 4.0 | `SIGTERM` 触发时优雅等待时间（秒），保证总清理约 5 秒 |
+| `SIGNAL_CLEANUP_BUDGET` | 5.0 | 信号触发后整个清理流程总预算（秒） |
 | `SIGNAL_TERMINATE_JOIN_TIMEOUT` | 0.5 | 信号触发时 `terminate` 后等待时间（秒） |
 | `SIGNAL_KILL_JOIN_TIMEOUT` | 0.5 | 信号触发时 `kill` 后等待时间（秒） |
+| `SIGNAL_GRACEFUL_TIMEOUT` | 4.0 | `SIGTERM` 触发时优雅等待时间（秒），由总预算自动推导 |
 
 ## 使用限制
 
