@@ -42,6 +42,19 @@ DEFAULT_TERMINATE_JOIN_TIMEOUT_NO_WAIT: float = 0.2
 DEFAULT_RESULT_QUEUE_TIMEOUT: float = 0.2
 """结果收集线程从结果队列取数据的超时时间（秒）。"""
 
+SIGNAL_GRACEFUL_TIMEOUT: float = 4.0
+"""SIGTERM 触发优雅关闭时，给工作者的最长等待时间（秒）。
+
+留出 1 秒余量给后续的 terminate / kill 阶段，确保整个信号清理流程
+在约 5 秒内完成。
+"""
+
+SIGNAL_TERMINATE_JOIN_TIMEOUT: float = 0.5
+"""信号触发关闭时，terminate 后等待工作者退出的秒数。"""
+
+SIGNAL_KILL_JOIN_TIMEOUT: float = 0.5
+"""信号触发关闭时，kill 后等待工作者退出的秒数。"""
+
 SHUTDOWN_SENTINEL: Any = None
 """任务队列关闭哨兵。"""
 
@@ -254,9 +267,18 @@ class ProcessPool:
         signum = getattr(self, "_shutdown_signal", None)
         # SIGTERM 通常表示外部要求优雅退出，给工作者默认的 graceful 时间；
         # SIGINT（Ctrl+C）等其它信号则快速关闭，避免用户等待过长。
+        # 信号触发的清理总预算控制在约 5 秒：
+        #   SIGTERM: 4s 优雅 + 0.5s terminate join + 0.5s kill join
+        #   SIGINT:  0.2s terminate join + 0.5s kill join
         graceful = signum == signal.SIGTERM
         try:
-            self.shutdown(wait=graceful, timeout=DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT)
+            self.shutdown(
+                wait=graceful,
+                timeout=SIGNAL_GRACEFUL_TIMEOUT,
+                _terminate_join_timeout=SIGNAL_TERMINATE_JOIN_TIMEOUT,
+                _kill_join_timeout=SIGNAL_KILL_JOIN_TIMEOUT,
+                _no_wait_terminate_join_timeout=DEFAULT_TERMINATE_JOIN_TIMEOUT_NO_WAIT,
+            )
         except Exception:  # noqa: BLE001
             logger.exception("Error during signal-triggered shutdown.")
 
@@ -366,7 +388,15 @@ class ProcessPool:
         # 不返回给调用方，由结果收集线程负责释放。
         self.submit(func, *args, **kwargs)
 
-    def shutdown(self, wait: bool = True, timeout: float | None = None) -> None:
+    def shutdown(
+        self,
+        wait: bool = True,
+        timeout: float | None = None,
+        *,
+        _terminate_join_timeout: float = DEFAULT_TERMINATE_JOIN_TIMEOUT,
+        _kill_join_timeout: float = DEFAULT_KILL_JOIN_TIMEOUT,
+        _no_wait_terminate_join_timeout: float = DEFAULT_TERMINATE_JOIN_TIMEOUT_NO_WAIT,
+    ) -> None:
         """关闭进程池。
 
         Args:
@@ -407,9 +437,7 @@ class ProcessPool:
                 worker.terminate()
 
         # 给被 terminate 的进程极短的时间自行清理，避免 atexit 长时间阻塞。
-        join_timeout = (
-            DEFAULT_TERMINATE_JOIN_TIMEOUT if wait else DEFAULT_TERMINATE_JOIN_TIMEOUT_NO_WAIT
-        )
+        join_timeout = _terminate_join_timeout if wait else _no_wait_terminate_join_timeout
         for worker in self._workers:
             if worker.is_alive():
                 worker.join(timeout=join_timeout)
@@ -418,7 +446,7 @@ class ProcessPool:
             if worker.is_alive():
                 logger.warning("Worker %s did not terminate, killing.", worker.pid)
                 worker.kill()
-                worker.join(timeout=DEFAULT_KILL_JOIN_TIMEOUT)
+                worker.join(timeout=_kill_join_timeout)
 
         with self._lock:
             for future in list(self._futures.values()):
