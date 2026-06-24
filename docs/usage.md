@@ -25,10 +25,10 @@ with ProcessPool(max_workers=4) as pool:
 ## 作为服务长期持有（推荐）
 
 如果你需要在 Web 服务、后台任务队列等场景中反复提交任务，应该避免频繁创建/销毁进程池。
-可以使用 `WorkerService` 把进程池作为长生命周期对象持有：
+可以使用 `ProcessPoolService` 把进程池作为长生命周期对象持有：
 
 ```python
-from pyprocess.pool_service import WorkerService
+from pyprocess.pool_service import ProcessPoolService
 
 
 def heavy_compute(n: int) -> int:
@@ -36,12 +36,12 @@ def heavy_compute(n: int) -> int:
 
 
 # 方式一：上下文管理器
-with WorkerService(max_workers=4) as service:
+with ProcessPoolService(max_workers=4) as service:
     future = service.submit(heavy_compute, 100_000)
     print(future.result(timeout=10))
 
 # 方式二：显式生命周期管理
-service = WorkerService(max_workers=4)
+service = ProcessPoolService(max_workers=4)
 service.start()
 
 try:
@@ -52,7 +52,7 @@ finally:
     service.shutdown(wait=True)
 ```
 
-`WorkerService` 特点：
+`ProcessPoolService` 特点：
 - 线程安全
 - 首次 `submit()` 会自动启动（懒启动）
 - 关闭后允许再次 `start()` 重启

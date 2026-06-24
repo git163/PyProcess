@@ -13,10 +13,10 @@ from pyprocess.pool import Future, ProcessPool
 
 T = TypeVar("T")
 
-__all__ = ["WorkerService"]
+__all__ = ["ProcessPoolService"]
 
 
-class WorkerService:
+class ProcessPoolService:
     """长生命周期进程池服务。
 
     对 `ProcessPool` 做了一层薄封装，提供线程安全的提交接口和统一的生命周期管理。
@@ -96,12 +96,12 @@ class WorkerService:
         """确保服务已启动；未启动时自动启动，已关闭则抛异常。"""
         with self._lock:
             if self._shutdown:
-                raise RuntimeError("WorkerService has been shut down")
+                raise RuntimeError("ProcessPoolService has been shut down")
             if not self._started:
                 self._pool.start()
                 self._started = True
 
-    def __enter__(self) -> WorkerService:
+    def __enter__(self) -> ProcessPoolService:
         self.start()
         return self
 

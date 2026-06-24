@@ -1,4 +1,4 @@
-"""WorkerService 单元测试。"""
+"""ProcessPoolService 单元测试。"""
 
 import os
 import threading
@@ -7,7 +7,7 @@ import time
 import pytest
 
 from pyprocess.pool import TaskError
-from pyprocess.pool_service import WorkerService
+from pyprocess.pool_service import ProcessPoolService
 
 
 def _add(a: int, b: int) -> int:
@@ -25,7 +25,7 @@ def _raise_value_error(message: str) -> None:
 
 def test_service_submit_and_result():
     """服务提交任务并获取结果。"""
-    service = WorkerService(max_workers=2)
+    service = ProcessPoolService(max_workers=2)
     service.start()
     try:
         future = service.submit(_add, 1, 2)
@@ -36,7 +36,7 @@ def test_service_submit_and_result():
 
 def test_service_auto_start_on_submit():
     """未显式 start 时，submit 自动启动服务。"""
-    service = WorkerService(max_workers=2)
+    service = ProcessPoolService(max_workers=2)
     try:
         future = service.submit(_add, 3, 4)
         assert future.result(timeout=5) == 7
@@ -47,21 +47,21 @@ def test_service_auto_start_on_submit():
 
 def test_service_context_manager():
     """上下文管理器自动启动和关闭服务。"""
-    with WorkerService(max_workers=2) as service:
+    with ProcessPoolService(max_workers=2) as service:
         future = service.submit(_add, 5, 6)
         assert future.result(timeout=5) == 11
 
 
 def test_service_submit_no_wait():
     """fire-and-forget 提交。"""
-    with WorkerService(max_workers=2) as service:
+    with ProcessPoolService(max_workers=2) as service:
         service.submit_no_wait(_add, 1, 2)
         time.sleep(0.2)
 
 
 def test_service_shutdown_then_submit():
     """关闭后再提交应抛 RuntimeError。"""
-    service = WorkerService(max_workers=2)
+    service = ProcessPoolService(max_workers=2)
     service.start()
     service.shutdown(wait=True)
     with pytest.raises(RuntimeError, match="shut down"):
@@ -70,7 +70,7 @@ def test_service_shutdown_then_submit():
 
 def test_service_double_shutdown():
     """重复关闭不应报错。"""
-    service = WorkerService(max_workers=2)
+    service = ProcessPoolService(max_workers=2)
     service.start()
     service.shutdown(wait=True)
     service.shutdown(wait=True)
@@ -78,7 +78,7 @@ def test_service_double_shutdown():
 
 def test_service_exception_propagation():
     """任务异常应包装为 TaskError。"""
-    with WorkerService(max_workers=2) as service:
+    with ProcessPoolService(max_workers=2) as service:
         future = service.submit(_raise_value_error, "boom")
         with pytest.raises(TaskError, match="boom"):
             future.result(timeout=5)
@@ -86,7 +86,7 @@ def test_service_exception_propagation():
 
 def test_service_worker_pids():
     """服务能返回工作进程 PID。"""
-    service = WorkerService(max_workers=2)
+    service = ProcessPoolService(max_workers=2)
     service.start()
     try:
         pids = service.worker_pids
@@ -97,7 +97,7 @@ def test_service_worker_pids():
 
 def test_service_is_running():
     """is_running 状态正确。"""
-    service = WorkerService(max_workers=2)
+    service = ProcessPoolService(max_workers=2)
     assert not service.is_running
     service.start()
     try:
@@ -110,15 +110,15 @@ def test_service_is_running():
 def test_service_reuse_across_many_tasks():
     """服务复用，提交大量任务。"""
     task_count = 100
-    with WorkerService(max_workers=4) as service:
+    with ProcessPoolService(max_workers=4) as service:
         futures = [service.submit(_add, i, i) for i in range(task_count)]
         results = [f.result(timeout=10) for f in futures]
     assert results == [i * 2 for i in range(task_count)]
 
 
 def test_service_high_load_shutdown_no_orphans():
-    """高负载下 WorkerService 关闭能按时完成且无残留。"""
-    service = WorkerService(max_workers=4)
+    """高负载下 ProcessPoolService 关闭能按时完成且无残留。"""
+    service = ProcessPoolService(max_workers=4)
     service.start()
     pids = service.worker_pids
 
@@ -131,7 +131,7 @@ def test_service_high_load_shutdown_no_orphans():
         service.shutdown(wait=True, timeout=2.0)
         elapsed = time.monotonic() - start
 
-        assert elapsed < 5.0, f"WorkerService shutdown took too long: {elapsed:.2f}s"
+        assert elapsed < 5.0, f"ProcessPoolService shutdown took too long: {elapsed:.2f}s"
     finally:
         if service.is_running:
             service.shutdown(wait=False)
@@ -148,8 +148,8 @@ def test_service_high_load_shutdown_no_orphans():
 
 
 def test_service_long_task_shutdown_no_orphans():
-    """长任务执行中关闭 WorkerService，验证无残留。"""
-    service = WorkerService(max_workers=2)
+    """长任务执行中关闭 ProcessPoolService，验证无残留。"""
+    service = ProcessPoolService(max_workers=2)
     service.start()
     pids = service.worker_pids
 
@@ -173,7 +173,7 @@ def test_service_long_task_shutdown_no_orphans():
 
 def test_service_shutdown_cancels_pending_futures():
     """高负载下关闭服务，未开始任务的 Future 应被立即取消。"""
-    service = WorkerService(max_workers=2)
+    service = ProcessPoolService(max_workers=2)
     service.start()
 
     try:
@@ -225,8 +225,8 @@ def _assert_no_residuals(pids: list[int], timeout: float = 5) -> None:
 
 @pytest.mark.parametrize("cycle_count", [3, 5])
 def test_service_start_stop_cycles(cycle_count: int) -> None:
-    """多次启停 WorkerService，每次都不应残留进程。"""
-    service = WorkerService(max_workers=2)
+    """多次启停 ProcessPoolService，每次都不应残留进程。"""
+    service = ProcessPoolService(max_workers=2)
     all_pids: set[int] = set()
 
     for _ in range(cycle_count):
@@ -250,7 +250,7 @@ def test_service_start_stop_cycles(cycle_count: int) -> None:
 )
 def test_service_concurrent_submission(thread_count: int, tasks_per_thread: int) -> None:
     """多线程并发向同一个服务提交任务，然后关闭，验证无残留。"""
-    service = WorkerService(max_workers=4)
+    service = ProcessPoolService(max_workers=4)
     service.start()
     pids = service.worker_pids
     errors: list[BaseException] = []
@@ -293,7 +293,7 @@ def test_service_concurrent_submission(thread_count: int, tasks_per_thread: int)
 )
 def test_service_mixed_tasks_shutdown(short_count: int, long_count: int) -> None:
     """短任务和长任务混合提交，执行中关闭服务，验证无残留。"""
-    service = WorkerService(max_workers=4)
+    service = ProcessPoolService(max_workers=4)
     service.start()
     pids = service.worker_pids
 
@@ -314,7 +314,7 @@ def test_service_mixed_tasks_shutdown(short_count: int, long_count: int) -> None
 
 def test_service_exception_storm_shutdown() -> None:
     """大量异常任务中关闭服务，验证无残留。"""
-    service = WorkerService(max_workers=4)
+    service = ProcessPoolService(max_workers=4)
     service.start()
     pids = service.worker_pids
 
@@ -332,7 +332,7 @@ def test_service_exception_storm_shutdown() -> None:
 @pytest.mark.parametrize("wait", [True, False])
 def test_service_fire_and_forget_under_load(wait: bool) -> None:
     """高负载 fire-and-forget 后关闭服务，验证无残留。"""
-    service = WorkerService(max_workers=4)
+    service = ProcessPoolService(max_workers=4)
     service.start()
     pids = service.worker_pids
 
@@ -349,7 +349,7 @@ def test_service_fire_and_forget_under_load(wait: bool) -> None:
 
 def test_service_lazy_start_concurrent_threads() -> None:
     """多个线程同时首次提交，懒启动不应出现竞态，关闭后无残留。"""
-    service = WorkerService(max_workers=4)
+    service = ProcessPoolService(max_workers=4)
     pids: list[int] = []
     errors: list[BaseException] = []
     lock = threading.Lock()
@@ -383,7 +383,7 @@ def test_service_lazy_start_concurrent_threads() -> None:
 
 def test_service_submit_shutdown_race() -> None:
     """一个线程持续提交，另一个线程关闭，验证无残留、无未处理异常。"""
-    service = WorkerService(max_workers=4)
+    service = ProcessPoolService(max_workers=4)
     service.start()
     pids = service.worker_pids
     submit_errors: list[BaseException] = []
@@ -420,8 +420,8 @@ def test_service_submit_shutdown_race() -> None:
 
 @pytest.mark.parametrize("cycle_count", [10, 20])
 def test_service_rapid_start_shutdown(cycle_count: int) -> None:
-    """频繁启停 WorkerService，验证无残留。"""
-    service = WorkerService(max_workers=2)
+    """频繁启停 ProcessPoolService，验证无残留。"""
+    service = ProcessPoolService(max_workers=2)
     all_pids: set[int] = set()
 
     for _ in range(cycle_count):
@@ -437,7 +437,7 @@ def test_service_context_manager_reuse() -> None:
     """多次使用上下文管理器创建服务，验证无残留。"""
     all_pids: set[int] = set()
     for i in range(5):
-        with WorkerService(max_workers=2) as service:
+        with ProcessPoolService(max_workers=2) as service:
             future = service.submit(_add, i, i)
             assert future.result(timeout=5) == i * 2
             all_pids.update(service.worker_pids)
