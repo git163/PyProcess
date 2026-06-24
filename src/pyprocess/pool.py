@@ -164,6 +164,7 @@ class ProcessPool:
         self._signal_installed = False
         self._shutdown_event = threading.Event()
         self._signal_thread: threading.Thread | None = None
+        self._health_thread: threading.Thread | None = None
 
     def start(self) -> None:
         """启动进程池，显式创建并启动工作进程。"""
@@ -192,6 +193,9 @@ class ProcessPool:
 
             self._signal_thread = threading.Thread(target=self._signal_watcher, daemon=True)
             self._signal_thread.start()
+
+            self._health_thread = threading.Thread(target=self._health_watcher, daemon=True)
+            self._health_thread.start()
 
             self._install_signal_handlers()
             self._started = True
@@ -225,6 +229,27 @@ class ProcessPool:
             self.shutdown(wait=False)
         except Exception:  # noqa: BLE001
             logger.exception("Error during signal-triggered shutdown.")
+
+    def _health_watcher(self, interval: float = 0.5) -> None:
+        """监控工作进程健康状态，发现异常死亡时主动关闭进程池。"""
+        while True:
+            time.sleep(interval)
+            with self._lock:
+                if self._shutdown or not self._started:
+                    break
+                workers = list(self._workers)
+
+            dead_workers = [w for w in workers if not w.is_alive()]
+            if dead_workers:
+                logger.warning(
+                    "Detected dead worker(s): %s. Initiating pool shutdown.",
+                    [w.pid for w in dead_workers],
+                )
+                try:
+                    self.shutdown(wait=False)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Error during health-triggered shutdown.")
+                break
 
     def _collect_results(self) -> None:
         """后台线程：从结果队列读取结果并填充 Future。"""
@@ -298,7 +323,8 @@ class ProcessPool:
 
         Args:
             wait: 是否等待工作进程优雅退出。
-            timeout: 优雅等待的最长秒数；None 时使用内部默认值 30 秒。
+            timeout: 优雅等待的最长秒数；None 时使用内部默认值 5 秒。
+                如果需要给长任务更多退出时间，可传入更大的值（如 30.0）。
         """
         with self._lock:
             if self._shutdown:
@@ -320,7 +346,7 @@ class ProcessPool:
 
         # 先尝试让工作者自己退出（收到哨兵后正常返回）。
         if wait:
-            graceful_timeout = 30.0 if timeout is None else timeout
+            graceful_timeout = 5.0 if timeout is None else timeout
             deadline = time.monotonic() + graceful_timeout
             for worker in self._workers:
                 remaining = max(0.0, deadline - time.monotonic())

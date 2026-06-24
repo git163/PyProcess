@@ -11,15 +11,6 @@ import pytest
 from pyprocess.pool import ProcessPool, TaskError
 
 
-def _pid_exists(pid: int) -> bool:
-    """通过发送信号 0 判断进程是否存在。"""
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
-        return False
-    return True
-
-
 def _identity(value: int) -> int:
     return value
 
@@ -166,41 +157,6 @@ def test_result_timeout_under_load():
         assert slow_future.done()
 
 
-def test_submit_after_worker_death():
-    """kill 一个空闲工作进程后，进程池仍能继续处理其他任务。"""
-    with ProcessPool(max_workers=4) as pool:
-        # 先让池子热身，确保所有工作者都已启动
-        futures = [pool.submit(_identity, i) for i in range(4)]
-        for f in futures:
-            f.result(timeout=5)
-
-        pids = pool.worker_pids
-        assert len(pids) == 4
-
-        # 杀死一个工作者（此时它应该空闲）
-        victim = pids[0]
-        os.kill(victim, signal.SIGKILL)
-
-        # 等待系统确认进程已消失，并给其他工作者处理时间
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            try:
-                os.kill(victim, 0)
-            except (OSError, ProcessLookupError):
-                break
-            time.sleep(0.05)
-
-        # 确认仍有 3 个工作者存活
-        remaining_pids = [pid for pid in pids if pid != victim]
-        for pid in remaining_pids:
-            assert _pid_exists(pid), f"Worker {pid} died unexpectedly"
-
-        # 剩余工作者应继续处理任务；由于容量减少，给更充裕的超时
-        futures = [pool.submit(_add_one, i) for i in range(8)]
-        results = sorted(f.result(timeout=30) for f in futures)
-        assert results == [i + 1 for i in range(8)]
-
-
 def test_pool_shutdown_after_worker_killed():
     """工作者被 kill 后，shutdown 仍能干净退出，不残留进程。"""
     pool = ProcessPool(max_workers=2)
@@ -218,6 +174,43 @@ def test_pool_shutdown_after_worker_killed():
         pool.shutdown(wait=True)
 
     # 被 kill 的工作者若变成僵尸，waitpid 会回收；仍存活则 assert 失败
+    for pid in pids:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        try:
+            os.kill(pid, 0)
+        except (OSError, ProcessLookupError):
+            continue
+        pytest.fail(f"Residual worker process detected: {pid}")
+
+
+def test_health_watcher_detects_dead_worker():
+    """健康监控发现工作者死亡后，应主动关闭进程池。"""
+    pool = ProcessPool(max_workers=2)
+    pool.start()
+    try:
+        # 提交一个长时间任务，确保至少一个工作者处于忙碌状态
+        pool.submit(time.sleep, 60)
+        time.sleep(0.3)  # 让任务被取走
+        pids = pool.worker_pids
+        assert len(pids) == 2
+
+        # 杀死一个工作者
+        os.kill(pids[0], signal.SIGKILL)
+
+        # 等待健康监控线程检测到死亡并触发 shutdown
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if pool._shutdown:
+                break
+            time.sleep(0.05)
+        assert pool._shutdown, "Health watcher did not trigger shutdown"
+    finally:
+        pool.shutdown(wait=True)
+
+    # 确认没有残留进程
     for pid in pids:
         try:
             os.waitpid(pid, os.WNOHANG)
