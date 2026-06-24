@@ -37,19 +37,28 @@ def _count_primes(upper: int) -> int:
 @pytest.mark.benchmark
 @pytest.mark.parametrize("worker_count", [1, 4, 8, 16])
 def test_worker_scaling(worker_count: int) -> None:
-    """测试不同工作进程数量下的执行时间。"""
+    """测试不同工作进程数量下的纯任务执行时间（不含进程启动耗时）。"""
     task_count = 8
     upper = 400000
 
-    start = time.perf_counter()
     if worker_count == 1:
         # 单进程串行执行
+        start = time.perf_counter()
         results = [_count_primes(upper) for _ in range(task_count)]
+        elapsed = time.perf_counter() - start
     else:
-        with ProcessPool(max_workers=worker_count) as pool:
-            futures = [pool.submit(_count_primes, upper) for _ in range(task_count)]
-            results = [f.result(timeout=120) for f in futures]
-    elapsed = time.perf_counter() - start
+        # 先启动并预热池子，不计入任务执行时间
+        pool = ProcessPool(max_workers=worker_count)
+        pool.start()
+        warmup = pool.submit(_count_primes, upper)
+        warmup.result(timeout=30)
+
+        start = time.perf_counter()
+        futures = [pool.submit(_count_primes, upper) for _ in range(task_count)]
+        results = [f.result(timeout=120) for f in futures]
+        elapsed = time.perf_counter() - start
+
+        pool.shutdown(wait=True)
 
     assert len(results) == task_count
     assert all(r == results[0] for r in results)
@@ -59,7 +68,7 @@ def test_worker_scaling(worker_count: int) -> None:
 @_SKIP_BENCHMARK
 @pytest.mark.benchmark
 def test_speedup_summary() -> None:
-    """汇总单进程与多进程的执行时间并输出加速比。"""
+    """汇总单进程与多进程的纯任务执行时间并输出加速比（不含进程启动耗时）。"""
     task_count = 8
     upper = 400000
 
@@ -72,11 +81,18 @@ def test_speedup_summary() -> None:
     speedups: dict[int, float] = {}
 
     for worker_count in [4, 8, 16]:
+        # 先启动并预热池子
+        pool = ProcessPool(max_workers=worker_count)
+        pool.start()
+        warmup = pool.submit(_count_primes, upper)
+        warmup.result(timeout=30)
+
         start = time.perf_counter()
-        with ProcessPool(max_workers=worker_count) as pool:
-            futures = [pool.submit(_count_primes, upper) for _ in range(task_count)]
-            results = [f.result(timeout=120) for f in futures]
+        futures = [pool.submit(_count_primes, upper) for _ in range(task_count)]
+        results = [f.result(timeout=120) for f in futures]
         elapsed = time.perf_counter() - start
+
+        pool.shutdown(wait=True)
 
         assert all(r == expected for r in results)
         speedups[worker_count] = single_time / elapsed
