@@ -155,16 +155,18 @@ pool.shutdown(wait=False)
 
 ## 信号处理与不残留子进程
 
-进程池启动后会注册 `SIGTERM` 和 `SIGINT` 处理函数。收到信号时，会自动调用 `shutdown(wait=False)`，尽可能避免工作进程残留。
+进程池启动后会注册 `SIGTERM` 和 `SIGINT` 处理函数：
 
-如果主进程被 `SIGKILL` 直接杀死（无法捕获），工作进程内部会通过**孤儿检测线程**定期检查父进程 PID（`os.getppid()`）。一旦发现父进程发生变化（例如被 init 收养），工作进程会主动退出。
+- `SIGTERM`（15）：触发**优雅关闭**（`shutdown(wait=True, timeout=5.0)`），给正在执行的任务最多 5 秒完成当前任务后退出；超时仍未退出则强制终止。
+- `SIGINT`（2，即 Ctrl+C）：触发**快速关闭**（`shutdown(wait=False)`），立即发送关闭哨兵并强制清理工作进程。
+- `SIGKILL`（9）：无法被捕获，由工作进程内部的**孤儿检测线程**处理。当工作进程发现父进程 PID 发生变化（例如被 init 收养），会主动退出，避免残留。
 
 ```python
 import time
 
 with ProcessPool(max_workers=4) as pool:
     pool.submit(time.sleep, 300)
-    # 此时按 Ctrl-C 或发送 SIGTERM，工作进程会被清理
+    # 按 Ctrl-C 快速退出；发送 SIGTERM 则优先优雅退出
 ```
 
 ## 可调参数

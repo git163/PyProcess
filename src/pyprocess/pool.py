@@ -243,15 +243,20 @@ class ProcessPool:
             logger.debug("Cannot install signal handlers in current context.")
 
     def _signal_handler(self, signum: int, _frame: Any) -> None:
-        """信号处理函数，仅设置事件，由守护线程执行关闭。"""
+        """信号处理函数，仅记录信号并设置事件，由守护线程执行关闭。"""
         logger.warning("Received signal %s, requesting pool shutdown.", signum)
+        self._shutdown_signal = signum
         self._shutdown_event.set()
 
     def _signal_watcher(self) -> None:
         """等待关闭事件，然后执行非信号安全的关闭逻辑。"""
         self._shutdown_event.wait()
+        signum = getattr(self, "_shutdown_signal", None)
+        # SIGTERM 通常表示外部要求优雅退出，给工作者默认的 graceful 时间；
+        # SIGINT（Ctrl+C）等其它信号则快速关闭，避免用户等待过长。
+        graceful = signum == signal.SIGTERM
         try:
-            self.shutdown(wait=False)
+            self.shutdown(wait=graceful, timeout=DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT)
         except Exception:  # noqa: BLE001
             logger.exception("Error during signal-triggered shutdown.")
 
