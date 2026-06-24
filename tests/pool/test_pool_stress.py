@@ -1,10 +1,14 @@
 """进程池压力与鲁棒性测试。"""
 
 import os
+import random
 import signal
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from pathlib import Path
 
 import pytest
 
@@ -262,3 +266,97 @@ def test_reuse_after_context_manager():
         with ProcessPool(max_workers=2) as pool:
             future = pool.submit(_identity, i)
             assert future.result(timeout=5) == i
+
+
+_RANDOM_SIGNAL_HELPER = Path(__file__).with_name("_random_signal_helper.py")
+
+
+def _start_random_signal_helper(max_workers: int = 4) -> tuple[subprocess.Popen, list[int]]:
+    """启动随机信号测试辅助脚本并解析工作进程 PID。"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    proc = subprocess.Popen(
+        [sys.executable, str(_RANDOM_SIGNAL_HELPER), str(max_workers)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+    pids: list[int] = []
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        line = proc.stdout.readline()
+        if not line:
+            time.sleep(0.05)
+            continue
+        if line.startswith("WORKERS"):
+            pids = [int(x) for x in line.strip().split()[1].split(",")]
+            break
+
+    if not pids:
+        stderr = proc.stderr.read()
+        proc.kill()
+        proc.wait(timeout=5)
+        raise RuntimeError(f"Failed to collect worker PIDs from helper. stderr: {stderr}")
+
+    return proc, pids
+
+
+def _pid_exists(pid: int) -> bool:
+    """判断进程是否仍存在。"""
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def _process_alive(pid: int) -> bool:
+    """判断进程是否仍在运行（非僵尸）。"""
+    try:
+        waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            return False
+        if waited_pid == 0:
+            return True
+    except ChildProcessError:
+        pass
+    return _pid_exists(pid)
+
+
+def _assert_no_residuals(pids: list[int], timeout: float = 5) -> None:
+    """等待并断言给定 PID 全部消失或变为僵尸并被回收。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(_process_alive(pid) for pid in pids):
+            return
+        time.sleep(0.1)
+    remaining = [pid for pid in pids if _process_alive(pid)]
+    assert not remaining, f"Residual worker processes detected: {remaining}"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics only")
+@pytest.mark.parametrize("_", range(5))
+def test_random_signal_during_long_tasks(_) -> None:
+    """在工作者执行长任务期间随机发送信号，验证约 5 秒内无残留。"""
+    proc, pids = _start_random_signal_helper(max_workers=4)
+    signal_choice = random.choice([signal.SIGTERM, signal.SIGINT, signal.SIGKILL])
+
+    # 随机等待 0.1~0.5 秒后发送信号，模拟任务执行中的随机异常
+    time.sleep(random.uniform(0.1, 0.5))
+    proc.send_signal(signal_choice)
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+        pytest.fail(f"Helper did not exit within 10s after signal {signal_choice}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    # 信号触发后约 5 秒内不应有残留工作进程
+    _assert_no_residuals(pids, timeout=6)
