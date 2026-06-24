@@ -83,6 +83,26 @@ with ProcessPool(max_workers=2) as pool:
         print(f"原始异常: {exc.cause}")  # RuntimeError: ValueError: value must be non-negative
 ```
 
+## fire-and-forget 提交
+
+如果你只关心任务被异步执行，不关心返回值，可以使用 `submit_no_wait()`：
+
+```python
+def send_email(user_id: int) -> None:
+    ...
+
+
+with ProcessPool(max_workers=4) as pool:
+    for user_id in user_ids:
+        pool.submit_no_wait(send_email, user_id)
+```
+
+### 注意事项
+
+- `submit_no_wait()` 不返回 `Future`，调用方无法直接获取结果或异常。
+- 任务抛出的异常会被内部 `Future` 捕获，但不会被调用方感知；如果你需要错误处理，请使用 `submit()`。
+- 任务完成后，内部状态会被结果收集线程自动清理，不会因忽略返回值而泄漏内存。
+
 ## 批量提交任务
 
 ```python

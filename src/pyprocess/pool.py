@@ -343,6 +343,24 @@ class ProcessPool:
             )
             return future
 
+    def submit_no_wait(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        """异步提交任务，不返回 Future。
+
+        适用于只关心任务被执行、不关心结果或异常的场景。
+        任务完成后由结果收集线程自动清理内部状态。
+
+        Args:
+            func: 可 pickle 的可调用对象。
+            *args: 位置参数。
+            **kwargs: 关键字参数。
+
+        Raises:
+            RuntimeError: 进程池已关闭。
+        """
+        # 内部仍创建 Future，用于消费结果队列、避免队列堵塞；
+        # 不返回给调用方，由结果收集线程负责释放。
+        self.submit(func, *args, **kwargs)
+
     def shutdown(self, wait: bool = True, timeout: float | None = None) -> None:
         """关闭进程池。
 

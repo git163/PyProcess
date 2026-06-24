@@ -141,7 +141,40 @@ def _exit_task() -> None:
     sys.exit(42)
 
 
-def test_task_returns_none():
+def test_submit_no_wait():
+    """fire-and-forget 提交不返回 Future，任务仍正常执行。"""
+    with ProcessPool(max_workers=2) as pool:
+        pool.submit_no_wait(_add, 3, 4)
+        pool.submit_no_wait(_add, 5, 6)
+        # 给任务一点执行时间
+        time.sleep(0.3)
+
+
+def test_submit_no_wait_exception_does_not_propagate():
+    """fire-and-forget 的任务异常不会抛到调用方。"""
+    with ProcessPool(max_workers=2) as pool:
+        pool.submit_no_wait(_raise_value_error, "silent boom")
+        # 立即提交下一个正常任务，验证池子未被阻塞
+        future = pool.submit(_add, 1, 2)
+        assert future.result(timeout=5) == 3
+
+
+def test_submit_then_submit_no_wait():
+    """混合使用 submit 和 submit_no_wait。"""
+    with ProcessPool(max_workers=2) as pool:
+        pool.submit_no_wait(_add, 1, 2)
+        future = pool.submit(_add, 3, 4)
+        assert future.result(timeout=5) == 7
+
+
+def test_shutdown_then_submit_no_wait():
+    """关闭后再 fire-and-forget 提交应抛 RuntimeError。"""
+    pool = ProcessPool(max_workers=2)
+    pool.start()
+    pool.shutdown(wait=True)
+    with pytest.raises(RuntimeError, match="shut down"):
+        pool.submit_no_wait(_add, 1, 2)
+
     """任务返回 None 时应正常处理。"""
     with ProcessPool(max_workers=2) as pool:
         future = pool.submit(_returns_none)
