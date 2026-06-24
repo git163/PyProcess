@@ -298,7 +298,7 @@ class ProcessPool:
 
         Args:
             wait: 是否等待工作进程优雅退出。
-            timeout: 最长等待秒数，None 表示按阶段默认等待。
+            timeout: 优雅等待的最长秒数；None 时使用内部默认值 30 秒。
         """
         with self._lock:
             if self._shutdown:
@@ -320,11 +320,10 @@ class ProcessPool:
 
         # 先尝试让工作者自己退出（收到哨兵后正常返回）。
         if wait:
-            deadline = None if timeout is None else (time.monotonic() + timeout)
+            graceful_timeout = 30.0 if timeout is None else timeout
+            deadline = time.monotonic() + graceful_timeout
             for worker in self._workers:
-                remaining = None
-                if deadline is not None:
-                    remaining = max(0.0, deadline - time.monotonic())
+                remaining = max(0.0, deadline - time.monotonic())
                 worker.join(timeout=remaining)
 
         # 强制终止尚未退出的工作者；wait=False 时也执行，避免程序退出时被 atexit 阻塞。
