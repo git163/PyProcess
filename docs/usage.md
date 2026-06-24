@@ -219,6 +219,60 @@ if __name__ == "__main__":
     main()
 ```
 
+## API 概览
+
+| 方法/属性 | 说明 |
+|-----------|------|
+| `ProcessPool(max_workers=...)` | 创建进程池，`max_workers` 默认为 CPU 核心数 |
+| `pool.start()` | 显式启动工作进程（上下文管理器会自动调用） |
+| `pool.submit(func, *args, **kwargs)` | 提交任务，返回 `Future` |
+| `pool.submit_no_wait(func, *args, **kwargs)` | 提交任务，不返回 `Future` |
+| `pool.shutdown(wait=True, timeout=None)` | 关闭进程池 |
+| `pool.worker_pids` | 获取当前工作进程 PID 列表 |
+| `future.result(timeout=None)` | 等待并返回结果 |
+| `future.wait(timeout=None)` | 等待任务完成，返回 `bool` |
+| `future.done()` | 查询任务是否已完成 |
+
+## submit 与 submit_no_wait 对比
+
+| 特性 | `submit()` | `submit_no_wait()` |
+|------|-----------|-------------------|
+| 返回值 | `Future` | `None` |
+| 获取结果 | ✅ 支持 | ❌ 不支持 |
+| 感知异常 | ✅ 通过 `.result()` 抛出 `TaskError` | ❌ 静默处理 |
+| 适用场景 | 需要结果或错误处理 | 纯异步触发，如日志、通知 |
+
+## 获取工作进程 PID
+
+```python
+pool = ProcessPool(max_workers=4)
+pool.start()
+print(pool.worker_pids)  # [12345, 12346, 12347, 12348]
+pool.shutdown(wait=True)
+```
+
+## 自定义关闭等待时间
+
+```python
+# 给长任务更多退出时间
+pool.shutdown(wait=True, timeout=30.0)
+
+# 立即强制关闭
+pool.shutdown(wait=False)
+```
+
+## 适用场景建议
+
+**适合使用进程池：**
+- CPU 密集型计算（图像处理、数值计算、数据转换）
+- 需要隔离内存、避免 GIL 限制的任务
+- 可能崩溃但不能影响主进程稳定性的任务
+
+**不建议使用进程池：**
+- 主要是 IO 等待的任务（网络请求、文件读写）：考虑线程池或 asyncio
+- 任务极小但数量极大：进程间通信开销可能抵消收益
+- 函数/参数不可 pickle：需要改用线程或在提交前序列化
+
 ## 运行基准测试
 
 项目提供了性能基准测试，用于对比不同工作进程数量下的加速比：
