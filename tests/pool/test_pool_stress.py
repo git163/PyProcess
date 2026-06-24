@@ -223,6 +223,30 @@ def test_health_watcher_detects_dead_worker():
         pytest.fail(f"Residual worker process detected: {pid}")
 
 
+def _unstable_long_task(should_raise: bool) -> str:
+    """模拟可能抛异常的长任务。"""
+    time.sleep(0.3)
+    if should_raise:
+        raise RuntimeError("unexpected failure in long task")
+    return "ok"
+
+
+def test_long_task_exception_and_cleanup():
+    """长任务执行中抛异常，池子仍能继续处理其他任务并干净退出。"""
+    with ProcessPool(max_workers=2) as pool:
+        # 一个会失败的长任务，两个正常的长任务
+        bad = pool.submit(_unstable_long_task, True)
+        good_1 = pool.submit(_unstable_long_task, False)
+        good_2 = pool.submit(_unstable_long_task, False)
+
+        assert good_1.result(timeout=10) == "ok"
+        assert good_2.result(timeout=10) == "ok"
+
+        with pytest.raises(TaskError) as exc_info:
+            bad.result(timeout=10)
+        assert "unexpected failure" in str(exc_info.value)
+
+
 def test_many_short_tasks_with_few_workers():
     """少量工作者处理海量短任务，验证吞吐和正确性。"""
     task_count = 500
