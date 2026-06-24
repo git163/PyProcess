@@ -260,7 +260,35 @@ def test_many_short_tasks_with_few_workers():
     assert results == [i + 1 for i in range(task_count)]
 
 
-def test_reuse_after_context_manager():
+def test_high_load_shutdown_no_orphans():
+    """高负载下 shutdown 仍能在超时内完成，不残留工作进程。"""
+    task_count = 1000
+    pool = ProcessPool(max_workers=4)
+    pool.start()
+    pids = pool.worker_pids
+
+    # 提交大量长任务，让任务队列堆积
+    for i in range(task_count):
+        pool.submit(_sleep_and_return, i, 10)
+
+    # 立即关闭，使用较短的超时验证高负载下也能按时完成
+    start = time.monotonic()
+    pool.shutdown(wait=True, timeout=2.0)
+    elapsed = time.monotonic() - start
+
+    # 关闭应在超时后不久完成，而不是等待所有堆积任务执行完
+    assert elapsed < 5.0, f"Shutdown took too long under high load: {elapsed:.2f}s"
+
+    # 所有工作进程应已退出
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not any(_process_alive(pid) for pid in pids):
+            break
+        time.sleep(0.1)
+    else:
+        remaining = [pid for pid in pids if _process_alive(pid)]
+        pytest.fail(f"Residual worker processes after high-load shutdown: {remaining}")
+
     """多次使用上下文管理器创建不同池子。"""
     for i in range(5):
         with ProcessPool(max_workers=2) as pool:

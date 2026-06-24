@@ -421,16 +421,37 @@ class ProcessPool:
                 return
             self._shutdown = True
 
+            # 高负载场景下任务队列可能堆积大量待处理任务。直接发送关闭哨兵会导致
+            # 哨兵排在所有待处理任务之后，工作者需处理完堆积任务才能退出，从而
+            # 延迟关闭并可能超出超时时间。这里先排空队列中尚未被取走的任务，
+            # 并立即取消对应的 Future；正在执行的任务保留其 Future，等待结果收集。
+            pending_task_ids: set[str] = set()
+            if self._task_queue is not None:
+                try:
+                    while True:
+                        task = self._task_queue.get_nowait()
+                        if task is not SHUTDOWN_SENTINEL and isinstance(task, dict):
+                            pending_task_ids.add(task.get("id"))
+                except queue.Empty:
+                    pass
+                except Exception:
+                    logger.exception("Failed to drain task queue during shutdown.")
+
+            for task_id in pending_task_ids:
+                future = self._futures.pop(task_id, None)
+                if future is not None:
+                    future._set_error(TaskError("Pool shut down before task completed"))
+
             if self._task_queue is not None:
                 try:
                     for _ in self._workers:
-                        self._task_queue.put(SHUTDOWN_SENTINEL)
+                        self._task_queue.put_nowait(SHUTDOWN_SENTINEL)
                 except Exception:
                     logger.exception("Failed to send shutdown sentinel.")
 
             if self._result_queue is not None:
                 try:
-                    self._result_queue.put(SHUTDOWN_SENTINEL)
+                    self._result_queue.put_nowait(SHUTDOWN_SENTINEL)
                 except Exception:
                     pass
 
