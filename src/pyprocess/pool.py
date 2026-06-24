@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import queue
 import signal
 import threading
 import time
@@ -21,6 +22,28 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 __all__ = ["Future", "ProcessPool", "TaskError"]
+
+# 进程池默认配置常量，便于统一调整。
+DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT: float = 5.0
+"""shutdown 时等待工作者优雅退出的默认秒数。"""
+
+DEFAULT_TERMINATE_JOIN_TIMEOUT: float = 1.0
+"""发出 terminate 后等待工作者退出的秒数。"""
+
+DEFAULT_KILL_JOIN_TIMEOUT: float = 1.0
+"""发出 kill 后等待工作者退出的秒数。"""
+
+DEFAULT_WORKER_POLL_INTERVAL: float = 0.5
+"""孤儿检测与健康监控轮询间隔（秒）。"""
+
+DEFAULT_TERMINATE_JOIN_TIMEOUT_NO_WAIT: float = 0.2
+"""wait=False 时发出 terminate 后等待工作者退出的秒数。"""
+
+DEFAULT_RESULT_QUEUE_TIMEOUT: float = 0.2
+"""结果收集线程从结果队列取数据的超时时间（秒）。"""
+
+SHUTDOWN_SENTINEL: Any = None
+"""任务队列关闭哨兵。"""
 
 
 class TaskError(Exception):
@@ -80,7 +103,7 @@ class Future(Generic[T]):
             self._event.set()
 
 
-def _orphan_watcher(original_ppid: int, interval: float = 0.5) -> None:
+def _orphan_watcher(original_ppid: int, interval: float = DEFAULT_WORKER_POLL_INTERVAL) -> None:
     """在工作者进程中运行，检测到父进程变化时主动退出。
 
     当父进程被 SIGKILL 等不可捕获信号终止后，子进程会被系统中最近的存活祖先收养。
@@ -113,7 +136,9 @@ def _worker_entry(parent_pid: int, task_queue: mp.Queue, result_queue: mp.Queue)
         )
         os._exit(1)
 
-    watcher = threading.Thread(target=_orphan_watcher, args=(parent_pid,), daemon=True)
+    watcher = threading.Thread(
+        target=_orphan_watcher, args=(parent_pid, DEFAULT_WORKER_POLL_INTERVAL), daemon=True
+    )
     watcher.start()
 
     while True:
@@ -123,7 +148,7 @@ def _worker_entry(parent_pid: int, task_queue: mp.Queue, result_queue: mp.Queue)
             logger.info("Worker %s task queue closed, exiting.", os.getpid())
             break
 
-        if task is None:
+        if task is SHUTDOWN_SENTINEL:
             logger.debug("Worker %s received shutdown sentinel.", os.getpid())
             break
 
@@ -230,7 +255,7 @@ class ProcessPool:
         except Exception:  # noqa: BLE001
             logger.exception("Error during signal-triggered shutdown.")
 
-    def _health_watcher(self, interval: float = 0.5) -> None:
+    def _health_watcher(self, interval: float = DEFAULT_WORKER_POLL_INTERVAL) -> None:
         """监控工作进程健康状态，发现异常死亡时主动关闭进程池。"""
         while True:
             time.sleep(interval)
@@ -255,15 +280,15 @@ class ProcessPool:
         """后台线程：从结果队列读取结果并填充 Future。"""
         while True:
             try:
-                result = self._result_queue.get(timeout=0.2)
+                result = self._result_queue.get(timeout=DEFAULT_RESULT_QUEUE_TIMEOUT)
             except (OSError, EOFError):
                 break
-            except Exception:
+            except queue.Empty:
                 if self._shutdown:
                     break
                 continue
 
-            if result is None:
+            if result is SHUTDOWN_SENTINEL:
                 break
 
             task_id = result["id"]
@@ -334,19 +359,19 @@ class ProcessPool:
             if self._task_queue is not None:
                 try:
                     for _ in self._workers:
-                        self._task_queue.put(None)
+                        self._task_queue.put(SHUTDOWN_SENTINEL)
                 except Exception:
                     logger.exception("Failed to send shutdown sentinel.")
 
             if self._result_queue is not None:
                 try:
-                    self._result_queue.put(None)
+                    self._result_queue.put(SHUTDOWN_SENTINEL)
                 except Exception:
                     pass
 
         # 先尝试让工作者自己退出（收到哨兵后正常返回）。
         if wait:
-            graceful_timeout = 5.0 if timeout is None else timeout
+            graceful_timeout = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT if timeout is None else timeout
             deadline = time.monotonic() + graceful_timeout
             for worker in self._workers:
                 remaining = max(0.0, deadline - time.monotonic())
@@ -359,7 +384,9 @@ class ProcessPool:
                 worker.terminate()
 
         # 给被 terminate 的进程极短的时间自行清理，避免 atexit 长时间阻塞。
-        join_timeout = 1.0 if wait else 0.2
+        join_timeout = (
+            DEFAULT_TERMINATE_JOIN_TIMEOUT if wait else DEFAULT_TERMINATE_JOIN_TIMEOUT_NO_WAIT
+        )
         for worker in self._workers:
             if worker.is_alive():
                 worker.join(timeout=join_timeout)
@@ -368,7 +395,7 @@ class ProcessPool:
             if worker.is_alive():
                 logger.warning("Worker %s did not terminate, killing.", worker.pid)
                 worker.kill()
-                worker.join(timeout=1.0)
+                worker.join(timeout=DEFAULT_KILL_JOIN_TIMEOUT)
 
         with self._lock:
             for future in list(self._futures.values()):
