@@ -36,6 +36,9 @@ where = ["src"]
 minversion = "7.0"
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "benchmark: marks tests as performance benchmarks (run with -m benchmark)",
+]
 
 [tool.ruff]
 line-length = 100
