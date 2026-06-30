@@ -208,11 +208,14 @@ class ProcessPool:
         self._workers: list[mp.Process] = []
         self._started = False
         self._shutdown = False
-        self._lock = threading.Lock()
+        # 使用可重入锁：submit() 持锁时可能调用 start()，两者获取同一把锁，
+        # 非重入锁会死锁。
+        self._lock = threading.RLock()
         self._futures: dict[str, Future[Any]] = {}
         self._collector: threading.Thread | None = None
         self._signal_installed = False
         self._shutdown_event = threading.Event()
+        self._shutdown_signal: int | None = None
         self._signal_thread: threading.Thread | None = None
         self._health_thread: threading.Thread | None = None
 
@@ -459,7 +462,7 @@ class ProcessPool:
                 try:
                     self._result_queue.put_nowait(SHUTDOWN_SENTINEL)
                 except Exception:
-                    pass
+                    logger.debug("Failed to put shutdown sentinel into result queue.")
 
         # 先尝试让工作者自己退出（收到哨兵后正常返回）。
         if wait:
