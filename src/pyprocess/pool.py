@@ -241,17 +241,20 @@ class ProcessPool:
             for worker in self._workers:
                 worker.start()
 
-            self._collector = threading.Thread(target=self._collect_results, daemon=True)
-            self._collector.start()
-
-            self._signal_thread = threading.Thread(target=self._signal_watcher, daemon=True)
-            self._signal_thread.start()
-
-            self._health_thread = threading.Thread(target=self._health_watcher, daemon=True)
-            self._health_thread.start()
-
+            self._start_background_threads()
             self._install_signal_handlers()
             self._started = True
+
+    def _start_background_threads(self) -> None:
+        """创建并启动结果收集、信号监听、健康监控三个守护线程。"""
+        self._collector = threading.Thread(target=self._collect_results, daemon=True)
+        self._collector.start()
+
+        self._signal_thread = threading.Thread(target=self._signal_watcher, daemon=True)
+        self._signal_thread.start()
+
+        self._health_thread = threading.Thread(target=self._health_watcher, daemon=True)
+        self._health_thread.start()
 
     @property
     def worker_pids(self) -> list[int]:
@@ -429,78 +432,112 @@ class ProcessPool:
             if self._shutdown:
                 return
             self._shutdown = True
+            # 持锁阶段：排空队列、取消 pending future、发送关闭哨兵。
+            self._drain_and_cancel_pending()
+            self._send_shutdown_sentinels()
 
-            # 高负载场景下任务队列可能堆积大量待处理任务。直接发送关闭哨兵会导致
-            # 哨兵排在所有待处理任务之后，工作者需处理完堆积任务才能退出，从而
-            # 延迟关闭并可能超出超时时间。这里先排空队列中尚未被取走的任务，
-            # 并立即取消对应的 Future；正在执行的任务保留其 Future，等待结果收集。
-            pending_task_ids: set[str] = set()
-            if self._task_queue is not None:
-                try:
-                    while True:
-                        task = self._task_queue.get_nowait()
-                        if task is not SHUTDOWN_SENTINEL and isinstance(task, dict):
-                            pending_task_ids.add(task.get("id"))
-                except queue.Empty:
-                    pass
-                except Exception:
-                    logger.exception("Failed to drain task queue during shutdown.")
-
-            for task_id in pending_task_ids:
-                future = self._futures.pop(task_id, None)
-                if future is not None:
-                    future._set_error(TaskError("Pool shut down before task completed"))
-
-            if self._task_queue is not None:
-                try:
-                    for _ in self._workers:
-                        self._task_queue.put_nowait(SHUTDOWN_SENTINEL)
-                except Exception:
-                    logger.exception("Failed to send shutdown sentinel.")
-
-            if self._result_queue is not None:
-                try:
-                    self._result_queue.put_nowait(SHUTDOWN_SENTINEL)
-                except Exception:
-                    logger.debug("Failed to put shutdown sentinel into result queue.")
-
+        # 释放锁后再操作工作进程，避免长时间持锁阻塞其它线程。
         # 先尝试让工作者自己退出（收到哨兵后正常返回）。
         if wait:
             graceful_timeout = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT if timeout is None else timeout
-            deadline = time.monotonic() + graceful_timeout
-            for worker in self._workers:
-                remaining = max(0.0, deadline - time.monotonic())
-                worker.join(timeout=remaining)
+            self._join_workers(graceful_timeout)
 
-        # 强制终止尚未退出的工作者；wait=False 时也执行，避免程序退出时被 atexit 阻塞。
+        # 强制终止仍存活的工作者；wait=False 时也执行，避免程序退出时被 atexit 阻塞。
+        terminate_join_timeout = (
+            _terminate_join_timeout if wait else _no_wait_terminate_join_timeout
+        )
+        self._terminate_workers(terminate_join_timeout)
+        self._kill_workers(_kill_join_timeout)
+
+        self._cancel_all_futures()
+        self._restore_signal_handlers()
+
+    def _drain_and_cancel_pending(self) -> None:
+        """排空任务队列中尚未被取走的任务，并立即取消对应的 Future。
+
+        必须在持有 ``self._lock`` 时调用。高负载场景下任务队列可能堆积大量待处理任务，
+        直接发送关闭哨兵会导致哨兵排在所有待处理任务之后，工作者需处理完堆积任务才能
+        退出，从而延迟关闭并可能超出超时时间。这里先排空尚未被取走的任务并取消其 Future；
+        正在执行的任务保留其 Future，等待结果收集。
+        """
+        pending_task_ids: set[str] = set()
+        if self._task_queue is not None:
+            try:
+                while True:
+                    task = self._task_queue.get_nowait()
+                    if task is not SHUTDOWN_SENTINEL and isinstance(task, dict):
+                        task_id = task.get("id")
+                        if task_id is not None:
+                            pending_task_ids.add(task_id)
+            except queue.Empty:
+                pass
+            except Exception:
+                logger.exception("Failed to drain task queue during shutdown.")
+
+        for task_id in pending_task_ids:
+            future = self._futures.pop(task_id, None)
+            if future is not None:
+                future._set_error(TaskError("Pool shut down before task completed"))
+
+    def _send_shutdown_sentinels(self) -> None:
+        """向任务队列发送 N 个关闭哨兵、向结果队列发送 1 个关闭哨兵。
+
+        必须在持有 ``self._lock`` 时调用。
+        """
+        if self._task_queue is not None:
+            try:
+                for _ in self._workers:
+                    self._task_queue.put_nowait(SHUTDOWN_SENTINEL)
+            except Exception:
+                logger.exception("Failed to send shutdown sentinel.")
+
+        if self._result_queue is not None:
+            try:
+                self._result_queue.put_nowait(SHUTDOWN_SENTINEL)
+            except Exception:
+                logger.debug("Failed to put shutdown sentinel into result queue.")
+
+    def _join_workers(self, timeout: float) -> None:
+        """在给定总预算内优雅 join 所有工作进程。"""
+        deadline = time.monotonic() + timeout
+        for worker in self._workers:
+            remaining = max(0.0, deadline - time.monotonic())
+            worker.join(timeout=remaining)
+
+    def _terminate_workers(self, join_timeout: float) -> None:
+        """terminate 仍存活的工作进程，并给极短时间自行清理，避免 atexit 长时间阻塞。"""
         for worker in self._workers:
             if worker.is_alive():
                 logger.warning("Worker %s did not exit gracefully, terminating.", worker.pid)
                 worker.terminate()
 
-        # 给被 terminate 的进程极短的时间自行清理，避免 atexit 长时间阻塞。
-        join_timeout = _terminate_join_timeout if wait else _no_wait_terminate_join_timeout
         for worker in self._workers:
             if worker.is_alive():
                 worker.join(timeout=join_timeout)
 
+    def _kill_workers(self, join_timeout: float) -> None:
+        """对 terminate 后仍存活的工作进程发送 kill 并等待退出。"""
         for worker in self._workers:
             if worker.is_alive():
                 logger.warning("Worker %s did not terminate, killing.", worker.pid)
                 worker.kill()
-                worker.join(timeout=_kill_join_timeout)
+                worker.join(timeout=join_timeout)
 
+    def _cancel_all_futures(self) -> None:
+        """给剩余未完成的 Future 设置关闭错误并清空 Future 表。"""
         with self._lock:
             for future in list(self._futures.values()):
                 future._set_error(TaskError("Pool shut down before task completed"))
             self._futures.clear()
 
+    def _restore_signal_handlers(self) -> None:
+        """恢复 SIGTERM/SIGINT 的默认处理函数。"""
         if self._signal_installed:
             try:
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
             except Exception:
-                pass
+                logger.debug("Failed to restore default signal handlers.")
             self._signal_installed = False
 
     def __enter__(self) -> ProcessPool:
