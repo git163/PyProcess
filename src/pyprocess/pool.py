@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import multiprocessing as mp
 import os
@@ -241,9 +242,20 @@ class ProcessPool:
             for worker in self._workers:
                 worker.start()
 
+            # 注册 atexit 兜底：即使调用方未显式 shutdown（例如手动 start 后主进程
+            # 抛未捕获异常、未使用 with/try-finally），解释器退出时也会触发清理。
+            # 否则非守护 worker 会阻塞在 task_queue.get()，导致 multiprocessing 的
+            # 退出 join 永久挂起、进程残留。注册需在 worker 启动后立即进行，
+            # 这样即使后续 _start_background_threads 抛异常也能清理已启动的 worker。
+            atexit.register(self._atexit_cleanup)
+
             self._start_background_threads()
             self._install_signal_handlers()
             self._started = True
+
+    def _atexit_cleanup(self) -> None:
+        """解释器退出时的兜底清理钩子，确保不残留 worker 进程。"""
+        self.shutdown(wait=False)
 
     def _start_background_threads(self) -> None:
         """创建并启动结果收集、信号监听、健康监控三个守护线程。"""
@@ -451,6 +463,8 @@ class ProcessPool:
 
         self._cancel_all_futures()
         self._restore_signal_handlers()
+        # 已显式关闭，注销 atexit 兜底，释放对本实例的引用（避免长期持有）。
+        atexit.unregister(self._atexit_cleanup)
 
     def _drain_and_cancel_pending(self) -> None:
         """排空任务队列中尚未被取走的任务，并立即取消对应的 Future。

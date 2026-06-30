@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 _HELPER = Path(__file__).with_name("_signal_helper.py")
+_EXCEPTION_HELPER = Path(__file__).with_name("_exception_helper.py")
 
 
 def _pid_exists(pid: int) -> bool:
@@ -43,12 +44,12 @@ def _process_alive(pid: int) -> bool:
     return _pid_exists(pid)
 
 
-def _start_helper() -> tuple[subprocess.Popen, list[int]]:
+def _start_helper(helper: Path = _HELPER) -> tuple[subprocess.Popen, list[int]]:
     """启动辅助脚本并解析工作进程 PID。"""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
     proc = subprocess.Popen(
-        [sys.executable, str(_HELPER)],
+        [sys.executable, str(helper)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -127,3 +128,29 @@ def test_normal_shutdown_no_orphans():
     pids = pool.worker_pids
     pool.shutdown(wait=True)
     _assert_no_residuals(pids, timeout=2)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics only")
+def test_uncaught_exception_no_orphan_workers():
+    """主进程手动 start 后抛未捕获异常、未 shutdown 时，atexit 兜底应清理 worker。
+
+    关键断言有两点：
+    1. 主进程能自行退出、不挂起（说明 multiprocessing 退出 join 未被非守护 worker 阻塞）；
+    2. 退出后无残留 worker 进程。
+    """
+    proc, pids = _start_helper(_EXCEPTION_HELPER)
+    try:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            pytest.fail("Process hung at exit; atexit cleanup did not unblock worker join.")
+        assert proc.returncode is not None
+        # 未捕获异常退出，返回码非 0。
+        assert proc.returncode != 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    _assert_no_residuals(pids)
